@@ -9,8 +9,14 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
+
   - id: last_dynamic_volume_calculation
     type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: media_player_pause_time
+    type: unsigned long
     restore_value: no
     initial_value: '0'
 
@@ -27,7 +33,7 @@ number:
     icon: "mdi:volume-high"
     unit_of_measurement: "x"
     entity_category: config
-    
+
   - platform: template 
     name: "Dyn. Vol. Strength"
     id: dynamic_volume_strength
@@ -39,6 +45,19 @@ number:
     optimistic: true
     icon: "mdi:volume-vibrate"
     unit_of_measurement: "x"
+    entity_category: config
+
+  - platform: template 
+    name: "Dyn. Vol. Pause Timeout"
+    id: dynamic_volume_idle_timeout
+    min_value: 0
+    max_value: 120
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "min"
     entity_category: config
 
 switch:
@@ -55,14 +74,12 @@ switch:
     turn_off_action:
       - lambda: |-
           id(dynamic_volume_enabled) = false;
-          // Reset to anchor volume when disabled
           id(external_media_player)
             ->make_call()
             .set_volume(id(dynamic_volume_anchor).state)
             .perform();
 
 sensor:
-  # Peak amplitude sensor
   - platform: template
     name: "Ambient Sound Peak"
     id: ambient_sound_peak
@@ -78,50 +95,54 @@ sensor:
       static const char *const TAG = "ambient_sound";
       static const size_t INPUT_BUFFER_SIZE = 512;
       static int16_t input_buffer[INPUT_BUFFER_SIZE];
-      
-      // Don't measure when media is playing to avoid feedback
-      if (id(external_media_player)->state != media_player::MEDIA_PLAYER_STATE_IDLE) {
-        ESP_LOGD(TAG, "Media player not idle.");
-        return id(ambient_sound_peak).state; // Return previous value
+
+      auto state = id(external_media_player)->state;
+      bool consider_idle = false;
+
+      if (state == media_player::MEDIA_PLAYER_STATE_IDLE) {
+        consider_idle = true;
+      } else if (state == media_player::MEDIA_PLAYER_STATE_PAUSED) {
+        float timeout_min = id(dynamic_volume_idle_timeout).state;
+        if (timeout_min > 0 && id(media_player_pause_time) > 0) {
+          unsigned long paused_ms = millis() - id(media_player_pause_time);
+          if (paused_ms >= (timeout_min * 60000)) {
+            consider_idle = true;
+          }
+        }
       }
-      
-      // Check if micro_wake_word is ready
+
+      if (!consider_idle) {
+        ESP_LOGD(TAG, "Media player not idle or timed-out paused.");
+        return id(ambient_sound_peak).state;
+      }
+
       if (!id(mww).is_ready()) {
         ESP_LOGD(TAG, "Micro wake word not ready yet");
         return 0;
       }
 
-      // Start mic if needed
       if (!id(asr_mic)->is_running()) {
         id(asr_mic)->start();
-        delay(50); // Give mic time to start
+        delay(50);
       }
 
-      size_t bytes_read = id(asr_mic)->read(
-        input_buffer, 
-        INPUT_BUFFER_SIZE * sizeof(int16_t),
-        0
-      );
-      
+      size_t bytes_read = id(asr_mic)->read(input_buffer, INPUT_BUFFER_SIZE * sizeof(int16_t), 0);
       if (bytes_read == 0) {
         memset(input_buffer, 0, INPUT_BUFFER_SIZE * sizeof(int16_t));
         ESP_LOGD(TAG, "No samples read from microphone");
         return 0;
       }
-      
+
       size_t samples_read = bytes_read / sizeof(int16_t);
-      
-      // Find maximum absolute value
       float max_value = 0;
       for (size_t i = 0; i < samples_read; i++) {
         float normalized = abs(input_buffer[i]) / 32768.0f;
         max_value = max(max_value, normalized);
       }
-      
+
       ESP_LOGD(TAG, "Max amplitude: %.6f", max_value);
       return max_value;
 
-  # Linear scaling sensor
   - platform: template
     name: "Ambient Sound Level Linear"
     id: ambient_sound_level
@@ -138,24 +159,20 @@ sensor:
       - throttle_average: 5s
     lambda: |-
       float peak = id(ambient_sound_peak).state;
-      if (std::isnan(peak)) {
-        return 0;
-      }
-      
-      // Simple linear scaling between min/max peak values
+      if (std::isnan(peak)) return 0;
+
       const float MIN_PEAK = 0.000024f;
       const float MAX_PEAK = 0.9f;
-      
+
       float percentage = 0;
       if (peak > MIN_PEAK) {
         percentage = (peak - MIN_PEAK) / (MAX_PEAK - MIN_PEAK) * 100;
         percentage = clamp(percentage, 0.0f, 100.0f);
       }
-      
+
       ESP_LOGD("ambient_sound", "Linear Percentage: %.1f%%", percentage);
       return percentage;
 
-  # Exponential scaling sensor
   - platform: template
     name: "Ambient Sound Level"
     id: ambient_sound_level_exp
@@ -171,19 +188,13 @@ sensor:
       - throttle_average: 5s
     lambda: |-
       float linear_value = id(ambient_sound_level).state;
-      if (std::isnan(linear_value)) {
-        return 0;
-      }
-      
-      // Apply exponential curve
-      // Using x^0.4 which gives more resolution to lower values while
-      // still maintaining a reasonable curve
+      if (std::isnan(linear_value)) return 0;
+
       constexpr float exp = 0.4f;
       float percentage = pow(linear_value / 100.0f, exp) * 100.0f;
-      
+
       ESP_LOGD("ambient_sound_exp", "Exponential scaling: %.1f%% -> %.1f%%", 
                linear_value, percentage);
-      
       return percentage;
 
 script:
@@ -192,36 +203,41 @@ script:
     then:
       - lambda: |-
           if (!id(dynamic_volume_enabled)) return;
-      
-          // Don't update volume when media is playing
-          if (id(external_media_player)->state != media_player::MEDIA_PLAYER_STATE_IDLE) return;
-          
+
+          auto state = id(external_media_player)->state;
+          bool consider_idle = false;
+
+          if (state == media_player::MEDIA_PLAYER_STATE_IDLE) {
+            consider_idle = true;
+          } else if (state == media_player::MEDIA_PLAYER_STATE_PAUSED) {
+            float timeout_min = id(dynamic_volume_idle_timeout).state;
+            if (timeout_min > 0 && id(media_player_pause_time) > 0) {
+              unsigned long paused_ms = millis() - id(media_player_pause_time);
+              if (paused_ms >= (timeout_min * 60000)) {
+                consider_idle = true;
+              }
+            }
+          }
+
+          if (!consider_idle) return;
+
           float ambient_level = id(ambient_sound_level_exp).state;
           if (std::isnan(ambient_level)) return;
-          
+
           float anchor = id(dynamic_volume_anchor).state;
           float strength = id(dynamic_volume_strength).state;
-          
-          // Convert ambient level to 0-1 range
           float normalized_level = ambient_level / 100.0f;
-          
-          // Calculate gain factor based on ambient level and strength
           float gain = 1.0f + (normalized_level * strength);
-          
-          // Calculate new volume 
           float new_volume = anchor * gain;
-          
-          // Clamp to valid range
           new_volume = clamp(new_volume, 0.0f, 1.0f);
-          
-          // Only update if changed significantly
+
           if (abs(new_volume - id(last_dynamic_volume_calculation)) > 0.01) {
             id(last_dynamic_volume_calculation) = new_volume;
             id(external_media_player)
               ->make_call()
               .set_volume(new_volume)
               .perform();
-            
+
             ESP_LOGD("dynamic_volume", "Ambient: %.1f%%, Gain: %.2f, New Volume: %.2f", 
                      ambient_level, gain, new_volume);
           }
@@ -230,6 +246,17 @@ interval:
   - interval: 5s
     then:
       - script.execute: update_dynamic_volume
+
+media_player:
+  - platform: ...
+    id: external_media_player
+    on_state:
+      - lambda: |-
+          if (x == media_player::MEDIA_PLAYER_STATE_PAUSED) {
+            id(media_player_pause_time) = millis();
+          } else {
+            id(media_player_pause_time) = 0;
+          }
 
 logger:
   level: INFO
